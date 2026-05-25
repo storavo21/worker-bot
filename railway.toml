@@ -1,0 +1,9 @@
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python worker_bot.py"
+restartPolicyMaxRetries = 5
+healthcheckPath = "/health"
+healthcheckInterval = 30

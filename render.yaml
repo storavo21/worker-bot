@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: worker-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python worker_bot.py
+    plan: free
+    envVars:
+      - key: MASTER_BOT_URL
+        sync: false
+      - key: SHARED_SECRET
+        value: you-secret-code
+      - key: WORKER_NAME
+        sync: false
+      - key: WORKER_PUBLIC_URL
+        sync: false
+      - key: WORKER_PORT
+        value: "8081"
