@@ -465,52 +465,56 @@ async def register_with_master():
     import json as json_lib
 
     worker_url = os.getenv("WORKER_PUBLIC_URL", f"http://localhost:{WORKER_PORT}")
-    register_url = f"{MASTER_BOT_URL.rstrip('/')}/register"
+    base_url = MASTER_BOT_URL.rstrip('/')
+
+    # Try both /register and /worker_register endpoints
+    endpoints = ["/register", "/worker_register"]
 
     for attempt in range(30):
-        try:
-            session = await get_session()
-            payload = {"worker_name": WORKER_NAME, "worker_url": worker_url}
+        for endpoint in endpoints:
+            try:
+                session = await get_session()
+                register_url = f"{base_url}{endpoint}"
+                payload = {"worker_name": WORKER_NAME, "worker_url": worker_url}
 
-            # Manually encode JSON to ensure proper Content-Type handling
-            json_data = json_lib.dumps(payload).encode('utf-8')
-            headers = {
-                "X-Secret": SHARED_SECRET,
-                "Content-Type": "application/json",
-                "Content-Length": str(len(json_data)),
-            }
+                json_data = json_lib.dumps(payload).encode('utf-8')
+                headers = {
+                    "X-Secret": SHARED_SECRET,
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(json_data)),
+                }
 
-            logger.info(f"[REGISTER] Attempt {attempt+1}: {register_url}")
-            logger.info(f"[SECRET] {SHARED_SECRET[:12]}...")
+                logger.info(f"[REGISTER] Attempt {attempt+1} ({endpoint}): {register_url}")
 
-            async with session.post(
-                register_url,
-                data=json_data,  # Use data instead of json
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10),
-                ssl=True  # Use SSL verification (Render should support it)
-            ) as r:
-                response_text = await r.text()
-                logger.info(f"[RESPONSE] Status {r.status}: {response_text[:150]}")
+                async with session.post(
+                    register_url,
+                    data=json_data,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                    ssl=True
+                ) as r:
+                    response_text = await r.text()
 
-                if r.status == 200:
-                    logger.info(f"✅ Registered with master as '{WORKER_NAME}' @ {worker_url}")
-                    return
+                    if r.status == 200:
+                        logger.info(f"✅ Registered with master as '{WORKER_NAME}' @ {worker_url}")
+                        return
 
-                if r.status == 403:
-                    logger.error(f"❌ 403 FORBIDDEN - Check: Master URL, X-Secret header, Cloudflare Access policy")
+                    if r.status == 403:
+                        logger.warning(f"403 on {endpoint}, trying next endpoint...")
+                    else:
+                        logger.warning(f"{endpoint} → HTTP {r.status}")
 
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout on attempt {attempt+1}")
-        except Exception as e:
-            logger.warning(f"Attempt {attempt+1} error: {str(e)[:100]}")
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout on {endpoint}")
+            except Exception as e:
+                logger.warning(f"Error on {endpoint}: {str(e)[:80]}")
 
         if attempt < 29:
             wait_time = min(10 * (attempt + 1), 60)
-            logger.info(f"Waiting {wait_time}s before retry...")
+            logger.info(f"Waiting {wait_time}s before next attempt...")
             await asyncio.sleep(wait_time)
 
-    logger.error("❌ Could not register after 30 attempts")
+    logger.error("❌ Could not register after 30 attempts on any endpoint")
 
 # ═══════════════════════════════════════════════════════════════════
 #  FASTAPI HTTP SERVER
