@@ -134,36 +134,52 @@ async def fetch_price_gecko(ca: str, session: aiohttp.ClientSession) -> Optional
     return None
 
 async def fetch_price_dex(ca: str, session: aiohttp.ClientSession) -> Optional[float]:
-    """DexScreener — fallback price source."""
-    endpoints = [
-        f"https://api.dexscreener.com/latest/dex/tokens/{ca}",
-        f"https://api.dexscreener.com/latest/dex/pairs/solana/{ca}",
-    ]
-    for ep in endpoints:
-        for attempt in range(2):
-            try:
-                async with session.get(ep, timeout=aiohttp.ClientTimeout(total=8)) as r:
-                    if r.status == 200:
-                        d = await r.json()
-                        pairs = d.get("pairs") or ([d.get("pair")] if d.get("pair") else [])
-                        for pair in (pairs or []):
-                            if pair and "priceUsd" in pair and pair["priceUsd"]:
-                                price = float(pair["priceUsd"])
-                                if price > 0:
-                                    api_stats["dexscreener"]["success"] += 1
-                                    return price
-                    elif r.status == 429:
-                        api_stats["dexscreener"]["fail"] += 1
-                        api_stats["dexscreener"]["last_error"] = "Rate limited (429)"
+    """DexScreener — fallback price source. Uses tokens endpoint only (mint addresses).
+    Picks the pool with highest liquidity to avoid stale/dead pairs."""
+    url = f"https://api.dexscreener.com/latest/dex/tokens/{ca}"
+    for attempt in range(2):
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    pairs = d.get("pairs") or []
+                    # Pick the Solana pair with highest USD liquidity
+                    sol_pairs = [p for p in pairs if p and p.get("chainId") == "solana"]
+                    sol_pairs.sort(
+                        key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0),
+                        reverse=True,
+                    )
+                    for pair in sol_pairs:
+                        pu = pair.get("priceUsd")
+                        if pu:
+                            try:
+                                price = float(pu)
+                            except (TypeError, ValueError):
+                                continue
+                            if price > 0:
+                                api_stats["dexscreener"]["success"] += 1
+                                return price
+                    api_stats["dexscreener"]["fail"] += 1
+                    api_stats["dexscreener"]["last_error"] = "No usable pair in response"
+                    return None
+                elif r.status == 429:
+                    api_stats["dexscreener"]["fail"] += 1
+                    api_stats["dexscreener"]["last_error"] = "Rate limited (429)"
+                    if attempt == 0:
                         await asyncio.sleep(5)
-            except asyncio.TimeoutError:
-                api_stats["dexscreener"]["fail"] += 1
-                api_stats["dexscreener"]["last_error"] = "Timeout"
-                if attempt == 0:
-                    await asyncio.sleep(2)
-            except Exception as e:
-                api_stats["dexscreener"]["fail"] += 1
-                api_stats["dexscreener"]["last_error"] = str(e)[:80]
+                else:
+                    api_stats["dexscreener"]["fail"] += 1
+                    api_stats["dexscreener"]["last_error"] = f"HTTP {r.status}"
+                    return None
+        except asyncio.TimeoutError:
+            api_stats["dexscreener"]["fail"] += 1
+            api_stats["dexscreener"]["last_error"] = "Timeout"
+            if attempt == 0:
+                await asyncio.sleep(2)
+        except Exception as e:
+            api_stats["dexscreener"]["fail"] += 1
+            api_stats["dexscreener"]["last_error"] = str(e)[:80]
+            return None
     return None
 
 async def get_price(ca: str) -> Optional[float]:
@@ -180,8 +196,6 @@ async def get_price(ca: str) -> Optional[float]:
         price = await fetch_price_dex(ca, session)
     if price and price > 0:
         _price_cache[ca] = (price, time.time())
-        # Report API stats to master
-        asyncio.create_task(report_api_stats())
     return price
 
 # ═══════════════════════════════════════════════════════════════════
@@ -323,7 +337,7 @@ async def cancel_job(job_id: str):
     logger.info(f"[JOB CANCEL] {job_id}")
 
 async def _tracking_loop(job_id: str):
-    """Main price tracking loop for one token."""
+    """Main price tracking loop for one token. Fetch first → then sleep."""
     try:
         while True:
             async with _jobs_lock:
@@ -331,22 +345,16 @@ async def _tracking_loop(job_id: str):
             if not job:
                 break
 
-            interval = int(job.get("interval_sec", 60))
-            await asyncio.sleep(interval)
-
-            async with _jobs_lock:
-                job = _jobs.get(job_id)
-            if not job:
-                break
-
             ca    = job["ca"]
             entry = job["entry_price"]
+            interval = int(job.get("interval_sec", 60))
 
             # Fetch current price
             price = await get_price(ca)
             if not price or price <= 0:
                 logger.warning(f"[PRICE FAIL] {job_id} — no price from any API")
-                await report_error(job_id, "gecko_terminal", "No price from any API")
+                await report_error(job_id, "price_fetch", "No price from any API")
+                await asyncio.sleep(interval)
                 continue
 
             # Update entry price on first successful read if entry was 0
@@ -382,6 +390,8 @@ async def _tracking_loop(job_id: str):
                 break
             else:
                 await report_price_update(job_id, job, price, current_pct, peak_pct, trailing_stop)
+
+            await asyncio.sleep(interval)
 
     except asyncio.CancelledError:
         pass
@@ -452,13 +462,36 @@ async def report_error(job_id: str, api_name: str, error_msg: str):
     })
 
 async def report_api_stats():
-    """Periodically push API stats to master."""
-    await _post_master("/worker_error", {
-        "job_id":       "_stats",
-        "worker_name":  WORKER_NAME,
-        "api_name":     "gecko_terminal",
-        "error_msg":    api_stats["gecko_terminal"]["last_error"],
-    }) if api_stats["gecko_terminal"]["last_error"] else None
+    """Push the full success/fail counter snapshot to master, then reset locally."""
+    # Build snapshot
+    snapshot = {}
+    for api, s in api_stats.items():
+        if s["success"] > 0 or s["fail"] > 0:
+            snapshot[api] = {
+                "success":    s["success"],
+                "fail":       s["fail"],
+                "last_error": s["last_error"],
+            }
+    if not snapshot:
+        return
+    ok = await _post_master("/worker_stats", {
+        "worker_name": WORKER_NAME,
+        "stats":       snapshot,
+    })
+    # Reset counters only on successful delivery, so we don't lose them on transient errors
+    if ok:
+        for api in snapshot:
+            api_stats[api]["success"] = 0
+            api_stats[api]["fail"]    = 0
+
+async def stats_reporter_loop():
+    """Background task: push stats every 60s."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await report_api_stats()
+        except Exception as e:
+            logger.warning(f"[STATS LOOP] {e}")
 
 async def register_with_master():
     """Register this worker with master on startup. Retries until success."""
@@ -591,6 +624,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"  Secret:     {SHARED_SECRET[:8]}...")
     logger.info("=" * 60)
     asyncio.create_task(register_with_master())
+    asyncio.create_task(stats_reporter_loop())
     yield
     # Clean up
     for task in _job_tasks.values():
