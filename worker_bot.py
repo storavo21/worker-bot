@@ -30,8 +30,12 @@ from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.responses import JSONResponse
 import uvicorn
 
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 try:
     from dotenv import load_dotenv
+    # Load .env next to this file regardless of process CWD (deploy runner safety).
+    load_dotenv(os.path.join(_BASE_DIR, ".env"))
     load_dotenv()
 except ImportError:
     pass
@@ -182,18 +186,23 @@ async def fetch_price_dex(ca: str, session: aiohttp.ClientSession) -> Optional[f
             return None
     return None
 
+_price_source_cache: Dict[str, str] = {}  # ca → last successful source name
+
 async def get_price(ca: str) -> Optional[float]:
     """Get price with cache. GeckoTerminal first, DexScreener fallback."""
-    # Check cache
     if ca in _price_cache:
         cached_price, cached_ts = _price_cache[ca]
         if time.time() - cached_ts < PRICE_CACHE_TTL:
             return cached_price
 
     session = await get_session()
-    price   = await fetch_price_gecko(ca, session)
-    if not price:
+    price = await fetch_price_gecko(ca, session)
+    if price:
+        _price_source_cache[ca] = "gecko"
+    else:
         price = await fetch_price_dex(ca, session)
+        if price:
+            _price_source_cache[ca] = "dexscreener"
     if price and price > 0:
         _price_cache[ca] = (price, time.time())
     return price
@@ -423,16 +432,18 @@ async def _post_master(endpoint: str, data: dict, retries: int = 2):
 
 async def report_price_update(job_id: str, job: dict, price: float,
                                pct: float, peak_pct: float, trailing_stop: float):
+    ca = job["ca"]
     await _post_master("/price_update", {
         "job_id":               job_id,
         "worker_name":          WORKER_NAME,
-        "ca":                   job["ca"],
+        "ca":                   ca,
         "source":               job["source"],
         "strategy_id":          job["strategy_id"],
         "current_price":        price,
         "pct_from_entry":       round(pct, 4),
         "peak_pct":             round(peak_pct, 4),
         "trailing_stop_price":  round(trailing_stop, 10),
+        "price_source":         _price_source_cache.get(ca, "unknown"),
         "timestamp":            datetime.utcnow().isoformat(),
     })
 
